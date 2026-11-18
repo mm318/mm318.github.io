@@ -1,90 +1,31 @@
 <!doctype html>
 <html lang="en">
-
 <head>
-    <meta charset=" utf-8">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZeroGraphics Demo</title>
-
     <style>
-        body {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            background: #444;
-            color: #98ffb1;
-        }
-
-        canvas {
-            box-sizing: border-box;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: -1;
-            padding: 2px;
-
-        }
+        html, body { margin: 0; width: 100%; height: 100%; background: #444; }
+        canvas { display: block; width: 100%; height: 100%; outline: none; }
+        #error { position: absolute; inset: 1em; color: #fff; white-space: pre-wrap; }
     </style>
-
-    <script type="module" defer="true">
-        import { barebonesWasi } from "./barebones-wasi.js";
-        import { createPlatformEnvironment, createInputModule, createWebGlModule, createWebsocketModule } from "./zero-graphics.js";
-
-        var wasiImports = new barebonesWasi();
-        const canvas_element = document.getElementById("render-canvas");
-        var globalInstance;
-
-        let imports = {
-            env: createPlatformEnvironment(() => globalInstance),
-            wasi_snapshot_preview1: wasiImports,
-            webgl: createWebGlModule(canvas_element, () => globalInstance),
-            input: createInputModule(canvas_element, () => globalInstance),
-            websocket: createWebsocketModule(() => globalInstance),
-        };
-
-        fetch("demo_application.wasm")
-            .then((response) => response.arrayBuffer())
-            .then((bytes) => WebAssembly.instantiate(bytes, imports))
-            .then((results) => results.instance)
-            .then((instance) => {
-                globalInstance = instance;
-                let res = instance.exports.app_init();
-                if (res == 0) {
-                    // run the update loop until the app dies
-                    function update() {
-                        const styles = window.getComputedStyle(canvas_element);
-
-                        const dx = parseFloat(styles.paddingLeft) + parseFloat(styles.paddingRight);
-                        const dy = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
-
-                        canvas_element.width = window.devicePixelRatio * (canvas_element.clientWidth - dx);
-                        canvas_element.height = window.devicePixelRatio * (canvas_element.clientHeight - dy);
-
-                        let res = instance.exports.app_update();
-                        if (res == 0) {
-                            requestAnimationFrame(update);
-                        } else {
-                            let error_ptr = instance.exports.app_get_error_ptr();
-                            let error_len = instance.exports.app_get_error_len();
-                            let view = new Uint8Array(instance.exports.memory.buffer, error_ptr, error_len);
-                            let str = new TextDecoder().decode(view);
-                            console.log("app_update returned error code ", str);
-                            alert(str);
-                        }
-                    }
-
-                    requestAnimationFrame(update);
-                } else {
-                    console.log("app_init returned ", res);
-                }
-            });
-    </script>
 </head>
-
 <body>
-    <canvas id="render-canvas" tabindex="1">
-    </canvas>
+    <canvas id="render-canvas" tabindex="0"></canvas>
+    <pre id="error" hidden></pre>
+    <script type="module">
+        import createZeroGraphics from './demo_application.js';
+        import {startApplication} from './zero-graphics.js';
+        const canvas = document.getElementById('render-canvas');
+        createZeroGraphics({canvas}).then(module => {
+            window.zeroGraphics = startApplication(module, canvas);
+            canvas.focus();
+        }).catch(error => {
+            console.error(error);
+            const message = document.getElementById('error');
+            message.hidden = false;
+            message.textContent = String(error);
+        });
+    </script>
 </body>
-
 </html>
