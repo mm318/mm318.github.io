@@ -33,6 +33,33 @@ function createPlatformEnvironment(getInstance) {
     }
 }
 
+function createClipboardModule(getInstance) {
+    let content = new Uint8Array()
+    let copied = false
+    return {
+        setContent(ptr, len) {
+            content = getInstance().HEAPU8.slice(ptr, ptr + len)
+            copied = true
+        },
+        getContent(ptr, maxLength) {
+            getInstance().HEAPU8.set(content.subarray(0, maxLength), ptr)
+            return content.length
+        },
+        handleEvent(ev, action) {
+            const inst = getInstance()
+            if (inst === undefined || !ev.clipboardData) return
+            copied = false
+            content = action === 2
+                ? utf8encoder.encode(ev.clipboardData.getData('text/plain'))
+                : new Uint8Array()
+            if (inst._app_clipboard(action)) {
+                if (action !== 2 && copied) ev.clipboardData.setData('text/plain', utf8decoder.decode(content))
+                if (action === 2 || copied) ev.preventDefault()
+            }
+        },
+    }
+}
+
 function createWebsocketModule(getInstance) {
     const getMemory = () => ({buffer: getInstance().HEAPU8.buffer})
 
@@ -359,52 +386,69 @@ function translateKeyEventToScancode(ev) {
     return null // no scancode mapping found
 }
 
-function createInputModule(canvas_element, getInstance, stop_fn) {
+function createInputModule(canvas_element, getInstance) {
     // we don't want to have the default context menu on our canvas.
     // this event handler will prevent the default menu from opening:
     canvas_element.addEventListener('contextmenu', (ev) => ev.preventDefault())
 
     // add pass through of the mousedown, mouseup and mousemove event into zig:
 
+    let dragging = false
+    function mousePosition(ev) {
+        const rect = canvas_element.getBoundingClientRect()
+        return [
+            Math.round((ev.clientX - rect.left) * canvas_element.width / rect.width),
+            Math.round((ev.clientY - rect.top) * canvas_element.height / rect.height),
+        ]
+    }
+
     canvas_element.addEventListener('mousedown', (ev) => {
         let inst = getInstance()
         if (inst !== undefined) {
-            inst._app_input_sendMouseDown(ev.clientX * window.devicePixelRatio, ev.clientY * window
-                .devicePixelRatio, ev.button)
+            canvas_element.focus({preventScroll: true})
+            dragging = true
+            inst._app_input_sendMouseDown(...mousePosition(ev), ev.button)
+            ev.preventDefault()
         }
     })
 
-    canvas_element.addEventListener('mouseup', (ev) => {
+    window.addEventListener('mouseup', (ev) => {
+        if (!dragging) return
+        dragging = false
         // ev.button: 0=>left, 1=>middle, 2=>right
         let inst = getInstance()
         if (inst !== undefined) {
-            inst._app_input_sendMouseUp(ev.clientX * window.devicePixelRatio, ev.clientY * window
-                .devicePixelRatio, ev.button)
+            inst._app_input_sendMouseUp(...mousePosition(ev), ev.button)
         }
     })
 
-    canvas_element.addEventListener('mousemove', (ev) => {
+    window.addEventListener('mousemove', (ev) => {
+        if (!dragging && ev.target !== canvas_element) return
         let inst = getInstance()
         if (inst !== undefined) {
-            inst._app_input_sendMouseMotion(ev.clientX * window.devicePixelRatio, ev.clientY * window
-                .devicePixelRatio)
+            inst._app_input_sendMouseMotion(...mousePosition(ev))
         }
     })
 
     // process keyboard input
+    const pressedScancodes = new Set()
     canvas_element.addEventListener('keydown', (ev) => {
         let inst = getInstance()
         if (inst === undefined) {
             return
         }
 
-        if (ev.repeat == false) {
-            let sc = translateKeyEventToScancode(ev)
-            if (sc !== null) {
-                inst._app_input_sendKeyDown(sc)
-            } else {
-                console.log('untranslated key code:', ev.code, ev)
-            }
+        // Let the browser supply ClipboardData during copy/cut/paste events.
+        if (((ev.ctrlKey || ev.metaKey) && ['KeyC', 'KeyX', 'KeyV', 'Insert'].includes(ev.code)) ||
+            (ev.shiftKey && ['Insert', 'Delete'].includes(ev.code))) return
+
+        let sc = translateKeyEventToScancode(ev)
+        if (sc !== null) {
+            pressedScancodes.add(sc)
+            inst._app_input_sendKeyDown(sc)
+            // Keep navigation, Tab and editing shortcuts inside the canvas.
+            // Printable keys retain their default so keypress supplies text.
+            if (ev.key.length !== 1 || ev.ctrlKey || ev.metaKey) ev.preventDefault()
         }
     })
 
@@ -414,12 +458,12 @@ function createInputModule(canvas_element, getInstance, stop_fn) {
             return
         }
 
-        if (ev.isComposing || ev.keyCode === 229) {
+        if (ev.isComposing || ev.keyCode === 229 || ev.ctrlKey || ev.metaKey) {
             // this is a pure key-down event
             return
         }
 
-        if (ev.charCode != 0) {
+        if (ev.charCode >= 32) {
             inst._app_input_sendTextInput(
                 ev.charCode,
                 ev.shiftKey,
@@ -439,12 +483,31 @@ function createInputModule(canvas_element, getInstance, stop_fn) {
         if (ev.repeat == false) {
             let sc = translateKeyEventToScancode(ev)
             if (sc !== null) {
+                pressedScancodes.delete(sc)
                 inst._app_input_sendKeyUp(sc)
             } else {
                 console.log('untranslated key code:', ev.code, ev)
             }
         }
     })
+
+    canvas_element.addEventListener('blur', () => {
+        const inst = getInstance()
+        if (inst !== undefined) {
+            for (const sc of pressedScancodes) inst._app_input_sendKeyUp(sc)
+        }
+        pressedScancodes.clear()
+    })
+
+    for (const [name, action] of [['copy', 0], ['cut', 1], ['paste', 2]]) {
+        // Firefox targets the DOM selection (often body) rather than a focused
+        // canvas. Route bubbling clipboard events by focus instead of target.
+        canvas_element.ownerDocument.addEventListener(name, ev => {
+            if (canvas_element.ownerDocument.activeElement === canvas_element) {
+                getInstance()?.zeroGraphics.clipboard.handleEvent(ev, action)
+            }
+        })
+    }
 }
 
 
@@ -452,8 +515,10 @@ export function startApplication(module, canvas) {
     const getModule = () => module;
     const platform = createPlatformEnvironment(getModule);
     const websocket = createWebsocketModule(getModule);
-    module.zeroGraphics = { platform, websocket, stopped: false };
-    createInputModule(canvas, () => module.zeroGraphics.stopped ? undefined : module);
+    const getRunningModule = () => module.zeroGraphics.stopped ? undefined : module;
+    const clipboard = createClipboardModule(getRunningModule);
+    module.zeroGraphics = { platform, websocket, clipboard, stopped: false };
+    createInputModule(canvas, getRunningModule);
     const resize = () => {
         canvas.width = Math.min(32767, Math.max(1, Math.round(canvas.clientWidth * devicePixelRatio)));
         canvas.height = Math.min(32767, Math.max(1, Math.round(canvas.clientHeight * devicePixelRatio)));
